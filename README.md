@@ -314,9 +314,9 @@ Lambda (1M requests/month), DynamoDB on-demand (pennies) and CodeDeploy for Lamb
 - Export the API for clients: `aws apigateway get-export --parameters extensions='apigateway' --export-type oas30 ...`
 - Generate an SDK: `aws apigateway get-sdk --sdk-type javascript ...`
 - Run `PreTraffic` / `PostTraffic` **hook functions** that test the new version before traffic shifts
-- Sister labs: [API Gateway (SAM quick build)](https://github.com/KwakuAdae/aws-api-gateway-lab) ·
-  [ECS Fargate](https://github.com/KwakuAdae/aws-ecr-ecs-fargate-lab) ·
-  [EKS](https://github.com/KwakuAdae/kwakuadae-aws-eks-website-lab) ·
+- Sister labs: [API Gateway (SAM quick build)](https://github.com/KwakuAdae/aws-serverless-tasks-api-lab) ·
+  [ECS Fargate](https://github.com/KwakuAdae/aws-ecs-fargate-website-lab) ·
+  [EKS](https://github.com/KwakuAdae/aws-eks-website-lab) ·
   [SQL with CloudFormation](https://github.com/KwakuAdae/aws-cloudformation-sql-lab) ·
   [CloudWatch Logs with Terraform](https://github.com/KwakuAdae/aws-cloudwatch-logs-terraform-lab)
 
