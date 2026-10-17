@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  API Gateway + SAM lab: a Books REST API defined with OpenAPI (request validation, mock
+  integration, API keys), backed by Lambda + DynamoDB, released gradually with CodeDeploy.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Deploy one stack per environment; also used as the API stage name
+  DeploymentType:
+    Type: String
+    Default: AllAtOnce
+    AllowedValues:
+      - AllAtOnce
+      - Canary10Percent5Minutes
+      - Linear10PercentEvery1Minute
+    Description: How CodeDeploy shifts traffic to a new Lambda version
+  EnableAccessLogs:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Write JSON access logs to CloudWatch. Sets the account-wide API Gateway logging role
+      for this region, so leave it off if your account already has one configured.
+
+Conditions:
+  AccessLogsOn: !Equals [!Ref EnableAccessLogs, "true"]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 128
+    Timeout: 10
+
+Resources:
+  # =====================================================================================
+  # Data
+  # =====================================================================================
+  BooksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-books"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # =====================================================================================
+  # Compute: every deploy publishes a new version and moves the "live" alias to it
+  # =====================================================================================
+  BooksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-handler"
+      CodeUri: src/
+      Handler: books.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BooksTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BooksTable
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: !Ref DeploymentType
+        Alarms:
+          - !Ref AliasErrorsAlarm      # roll back automatically if the new version errors
+
+  BooksFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BooksFunction}"
+      RetentionInDays: 7
+
+  # Allow API Gateway (this API only) to call the "live" alias
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BooksFunctionAliaslive
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${BooksApi}/*/*/*"
+
+  AliasErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-live-alias-errors"
+      AlarmDescription: Errors on the new Lambda version during a gradual deployment
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BooksFunction
+        - Name: Resource
+          Value: !Sub "${BooksFunction}:live"
+        - Name: ExecutedVersion
+          Value: !GetAtt BooksFunction.Version.Version
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # =====================================================================================
+  # API: the whole REST API is described by the OpenAPI document below
+  # =====================================================================================
+  BooksApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref Environment
+      OpenApiVersion: "3.0.1"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+      AccessLogSetting: !If
+        - AccessLogsOn
+        - DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.resourcePath","status":"$context.status","latencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integrationLatency","apiKeyId":"$context.identity.apiKeyId","error":"$context.error.message"}'
+        - !Ref AWS::NoValue
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: !Sub "${AWS::StackName}-api"
+          version: "1.0"
+          description: Books API. Every /books route requires the x-api-key header.
+
+        # API keys are read from the x-api-key header
+        x-amazon-apigateway-api-key-source: HEADER
+
+        # Named validators that methods can opt into
+        x-amazon-apigateway-request-validators:
+          body-only:
+            validateRequestBody: true
+            validateRequestParameters: false
+          params-only:
+            validateRequestBody: false
+            validateRequestParameters: true
+
+        # Customise API Gateway's own error responses
+        x-amazon-apigateway-gateway-responses:
+          BAD_REQUEST_BODY:
+            statusCode: 400
+            responseTemplates:
+              application/json: '{"message": "Invalid request body", "details": "$context.error.validationErrorString"}'
+          MISSING_AUTHENTICATION_TOKEN:
+            statusCode: 404
+            responseTemplates:
+              application/json: '{"message": "No such route: $context.httpMethod $context.path"}'
+          INVALID_API_KEY:
+            statusCode: 403
+            responseTemplates:
+              application/json: '{"message": "Missing or invalid x-api-key header"}'
+
+        paths:
+          /health:
+            get:
+              summary: Health check answered by API Gateway itself (MOCK integration)
+              responses:
+                "200":
+                  description: API is up
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: '{"status": "ok", "stage": "$context.stage", "requestId": "$context.requestId", "time": "$context.requestTime"}'
+
+          /books:
+            get:
+              summary: List books, optionally filtered by author
+              security: [{ api_key: [] }]
+              parameters:
+                - { name: author, in: query, required: false, schema: { type: string } }
+              responses:
+                "200": { description: List of books }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BooksFunctionAliaslive}/invocations"
+            post:
+              summary: Add a book (body validated by API Gateway before Lambda runs)
+              security: [{ api_key: [] }]
+              x-amazon-apigateway-request-validator: body-only
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema: { $ref: "#/components/schemas/Book" }
+              responses:
+                "201": { description: Created }
+                "400": { description: Invalid body }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BooksFunctionAliaslive}/invocations"
+
+          /books/{id}:
+            get:
+              summary: Get one book
+              security: [{ api_key: [] }]
+              parameters:
+                - { name: id, in: path, required: true, schema: { type: string } }
+              responses:
+                "200": { description: The book }
+                "404": { description: Not found }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BooksFunctionAliaslive}/invocations"
+            put:
+              summary: Update a book
+              security: [{ api_key: [] }]
+              parameters:
+                - { name: id, in: path, required: true, schema: { type: string } }
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema: { $ref: "#/components/schemas/BookUpdate" }
+              x-amazon-apigateway-request-validator: body-only
+              responses:
+                "200": { description: Updated }
+                "404": { description: Not found }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BooksFunctionAliaslive}/invocations"
+            delete:
+              summary: Delete a book
+              security: [{ api_key: [] }]
+              parameters:
+                - { name: id, in: path, required: true, schema: { type: string } }
+              responses:
+                "204": { description: Deleted }
+                "404": { description: Not found }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BooksFunctionAliaslive}/invocations"
+
+        components:
+          securitySchemes:
+            api_key:
+              type: apiKey
+              name: x-api-key
+              in: header
+          schemas:
+            Book:
+              type: object
+              required: [title, author]
+              additionalProperties: false
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                author: { type: string, minLength: 1, maxLength: 100 }
+                year: { type: integer, minimum: 1450, maximum: 2100 }
+            BookUpdate:
+              type: object
+              minProperties: 1
+              additionalProperties: false
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                author: { type: string, minLength: 1, maxLength: 100 }
+                year: { type: integer, minimum: 1450, maximum: 2100 }
+
+  # =====================================================================================
+  # API key + usage plan (defined explicitly, because the API comes from OpenAPI)
+  # =====================================================================================
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: BooksApiStage
+    Properties:
+      Name: !Sub "${AWS::StackName}-key"
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: BooksApiStage
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-plan"
+      Description: 10 requests/second, burst 20, 1000 requests/day
+      ApiStages:
+        - ApiId: !Ref BooksApi
+          Stage: !Ref Environment
+      Throttle:
+        RateLimit: 10
+        BurstLimit: 20
+      Quota:
+        Limit: 1000
+        Period: DAY
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # =====================================================================================
+  # Optional access logging (EnableAccessLogs=true)
+  # =====================================================================================
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: AccessLogsOn
+    # The stage references this log group, so this makes the stage wait until API Gateway's
+    # account-level logging role is registered (otherwise the stage fails to create).
+    DependsOn: ApiGatewayAccount
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access"
+      RetentionInDays: 7
+
+  ApiGatewayLogsRole:
+    Type: AWS::IAM::Role
+    Condition: AccessLogsOn
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: AccessLogsOn
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayLogsRole.Arn
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API stage
+    Value: !Sub "https://${BooksApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+  ApiKeyId:
+    Description: "Get the key value with: aws apigateway get-api-key --api-key <id> --include-value"
+    Value: !Ref ApiKey
+  FunctionAlias:
+    Description: The Lambda alias API Gateway invokes
+    Value: !Ref BooksFunctionAliaslive
+  TableName:
+    Description: DynamoDB table
+    Value: !Ref BooksTable

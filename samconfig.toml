@@ -1,0 +1,24 @@
+# One stack per environment:  sam deploy --config-env dev   /   sam deploy --config-env prod
+version = 0.1
+
+[default.global.parameters]
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+
+[dev.deploy.parameters]
+stack_name = "books-api-dev"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = false
+parameter_overrides = "Environment=dev DeploymentType=AllAtOnce EnableAccessLogs=false"
+
+[prod.deploy.parameters]
+stack_name = "books-api-prod"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = true
+parameter_overrides = "Environment=prod DeploymentType=Canary10Percent5Minutes EnableAccessLogs=false"
